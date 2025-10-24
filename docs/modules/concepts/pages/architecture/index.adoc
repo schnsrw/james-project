@@ -1,0 +1,148 @@
+= James Server Architecture Overview
+:navtitle: Architecture Overview
+
+This guide summarises the major components that make up an Apache James server
+and explains how they collaborate to deliver end-to-end mail handling.
+It focuses on the runtime architecture that is common across the
+packaged servers (memory, JPA, Cassandra, and distributed).
+
+== System overview
+
+James is structured as a set of cooperating subsystems. Protocol handlers
+receive client traffic, enqueue messages for asynchronous processing, and
+expose administrative APIs. The mail processing pipeline applies business
+rules to inbound and outbound traffic before persisting messages in the
+mailbox subsystem. Supporting services such as search, blob storage, event
+handling, and anti-spam enrich the core experience.
+
+=== Architecture diagram
+
+[listing]
+....
+                           +-------------------------+
+                           |  Administration & APIs  |
+                           | (WebAdmin, CLI, metrics)|
+                           +-----------+-------------+
+                                       |
+                                       v
++-----------+     +-------------+   +-------------------+   +------------------+
+| SMTP/LMTP | --> | Mail Queue  |-->|  Mailet Container |-->| Mailbox & Blob   |
+| POP3      |     |  & Spooler  |   |  (Matchers/Mailets)|  |   Storage        |
+| IMAP      |<--  | (RabbitMQ + |   +-------------------+   |  (Cassandra, S3, |
+| JMAP      |     | ObjectStore)|             |              |  JPA, etc.)      |
+| Manage-   |     +-------------+             |              +---------+--------+
+| Sieve     |                                 |                        |
++-----------+                                 v                        v
+                                            +-----------------+   +---------------+
+                                            | Event Bus &     |   | Search Index  |
+                                            | Mail Repositories|  | (OpenSearch,  |
+                                            +-----------------+   |  Tika)        |
+                                                                  +---------------+
+....
+
+The protocol layer handles client traffic. Messages accepted over SMTP or
+LMTP are persisted on the Mail Queue, from where the spooler feeds the
+Mailet Container. The mailet processing pipeline decides how a message
+should be handled, including local delivery, relay, or quarantine in a
+mail repository. Persistent message state lives in the mailbox subsystem,
+which relies on blob storage for large payloads and integrates with the
+search index via the event bus.
+
+== Component catalogue
+
+=== Protocol layer
+
+James exposes SMTP, LMTP, POP3, IMAP, WebAdmin and experimental JMAP and
+ManageSieve endpoints. These protocols cover message submission, delivery,
+retrieval, and remote management capabilities.
+
+=== Mail Queue and spooler
+
+Every accepted message is written to the Mail Queue, implemented as a
+combination of RabbitMQ for dispatch coordination and an object storage
+backend for the message payload. The spooler consumes queued entries and
+hands them to the Mailet Container for processing.
+
+=== Mailet Container
+
+The Mailet Container executes the configured mail processing pipeline. A
+spooler thread pulls a message from the queue and evaluates it through a
+series of matcher/mailet pairs organised into named processors. Matchers
+filter which mailets should run, while mailets apply mutations, trigger
+side effects, or route the message to another processor. Messages can be
+stored in dedicated mail repositories during processing for later review
+or reprocessing.
+
+=== Mail repositories
+
+Repositories such as `var/mail/error`, `var/mail/address-error`,
+`var/mail/relay-denied`, and `var/mail/rrt-error` persist messages when
+processing hits transient or logical issues. Operators can inspect these
+repositories to diagnose problems and reinject mail once the underlying
+cause is resolved.
+
+=== Mailbox subsystem
+
+The mailbox component stores per-user mail and exposes retrieval protocols
+such as IMAP and JMAP. Metadata resides in a chosen backend (Cassandra for
+the distributed server, JPA or memory for smaller deployments), while
+message bodies, headers, and attachments are offloaded to a blob store.
+
+==== Search and text extraction
+
+Mail content is asynchronously indexed in OpenSearch through event bus
+listeners to enable full-text queries and rich filtering. Deployments can
+optionally integrate an Apache Tika server to extract text from binary
+attachments prior to indexing.
+
+==== Quotas and projections
+
+Mailbox quotas are stored as projections in the backing metadata store.
+Administrators can define limits globally, per domain, or per user, and
+quota updates are propagated through the event bus.
+
+=== Event bus
+
+The event bus notifies interested listeners about mailbox operations such
+as mailbox creation, message addition or expunges, rights updates, and
+quota changes. Listeners—running on any node in a cluster—consume these
+events to maintain secondary projections like the search index, update
+metrics, or integrate with anti-spam systems.
+
+=== External integrations
+
+Optional components, including SpamAssassin or Rspamd, can process user
+feedback and annotate messages. Metrics and observability integrations
+expose operational data through WebAdmin and compatible monitoring stacks.
+
+== Data flows
+
+=== Inbound message flow
+
+1. A remote SMTP or LMTP client connects and submits a message.
+2. The protocol handler persists the envelope and payload on the Mail Queue.
+3. The spooler dequeues the entry and invokes the configured processors in the
+   Mailet Container.
+4. Matchers determine which mailets should act; mailets mutate, relay, or
+   deliver the message to a local mailbox.
+5. On successful local delivery, the mailbox subsystem stores metadata in the
+   chosen backend and the payload in the blob store, then emits mailbox events.
+6. Event listeners index the message in OpenSearch, update quotas, and trigger
+   optional downstream services.
+
+=== Retrieval and client access flow
+
+1. A user connects via IMAP or JMAP to browse, search, and manipulate messages.
+2. The protocol layer fetches mailbox state from the metadata backend and blob
+   store via the mailbox API.
+3. Updates made by the user (reads, moves, flag changes) emit events that keep
+   projections and search indices consistent across the cluster.
+
+=== Administrative flow
+
+1. Operators invoke WebAdmin or CLI commands to manage domains, users, and
+   configuration.
+2. Administrative actions update the relevant projections and can publish
+   events for cluster-wide consistency.
+3. Observability endpoints expose health, metrics, and queue information so
+   administrators can monitor message throughput and diagnose issues.
