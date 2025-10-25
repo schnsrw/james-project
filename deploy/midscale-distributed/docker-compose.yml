@@ -105,10 +105,9 @@ services:
         condition: service_started
       s3:
         condition: service_started
-    configs:
-      - source: james-blobstore-s3
-        target: /root/conf/blob.properties
-        mode: 0444
+    volumes:
+      - james-var:/root/var
+      - ./conf/blobstore.s3.properties:/root/conf/blob.properties:ro
 
   james-filesystem:
     <<: *james-service
@@ -122,10 +121,9 @@ services:
         condition: service_started
       tika:
         condition: service_started
-    configs:
-      - source: james-blobstore-file
-        target: /root/conf/blob.properties
-        mode: 0444
+    volumes:
+      - james-var:/root/var
+      - ./conf/blobstore.file.properties:/root/conf/blob.properties:ro
 
 networks:
   james:
@@ -137,9 +135,3 @@ volumes:
   rabbitmq-data:
   james-var:
   s3-data:
-
-configs:
-  james-blobstore-s3:
-    file: ./conf/blobstore.s3.properties
-  james-blobstore-file:
-    file: ./conf/blobstore.file.properties
