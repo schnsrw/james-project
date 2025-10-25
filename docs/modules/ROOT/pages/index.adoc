@@ -25,7 +25,9 @@ This Reference Book is divided into the following Parts:
 **    A guide aimed at experienced developers, describing 
     how you can assemble your own specialized server.
 * xref:james-project:community:index.adoc[James Community]
-**    All about the Apache James community, and how you can be 
+**    All about the Apache James community, and how you can be
     part of this active and dynamic group, too!
+
+For an opinionated, production-ready Compose bundle see xref:midscale-deployment.adoc[Midscale Distributed Deployment with Docker Compose].
 
 Please note that this Reference Documentation is a **living document**. It is subject to change. You are currently reading version {page-version}. If you find anything that is unclear, unfinished, or confusing, please do not hestiate to xref:james-project:community:index.adoc[lend us a hand].
