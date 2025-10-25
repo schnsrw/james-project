@@ -1,0 +1,158 @@
+version: "3.9"
+
+x-james-service: &james-service
+  image: ${JAMES_IMAGE}
+  hostname: james.local
+  command:
+    - --generate-keystore
+  env_file:
+    - env/james.env
+  ports:
+    - "25:25"
+    - "465:465"
+    - "587:587"
+    - "110:110"
+    - "143:143"
+    - "993:993"
+    - "8000:8000"
+    - "80:80"
+  networks:
+    james:
+      aliases:
+        - james
+  volumes:
+    - james-var:/root/var
+
+services:
+  cassandra:
+    image: ${CASSANDRA_IMAGE}
+    env_file:
+      - env/cassandra.env
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    ports:
+      - "9042:9042"
+    networks:
+      - james
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  opensearch:
+    image: ${OPENSEARCH_IMAGE}
+    env_file:
+      - env/opensearch.env
+    environment:
+      - discovery.type=${OPENSEARCH_DISCOVERY_TYPE}
+      - DISABLE_INSTALL_DEMO_CONFIG=${DISABLE_INSTALL_DEMO_CONFIG}
+      - DISABLE_SECURITY_PLUGIN=${DISABLE_SECURITY_PLUGIN}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    networks:
+      - james
+
+  rabbitmq:
+    image: ${RABBITMQ_IMAGE}
+    env_file:
+      - env/rabbitmq.env
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - james
+
+  tika:
+    image: ${TIKA_IMAGE}
+    networks:
+      - james
+
+  s3:
+    profiles: ["s3"]
+    image: ${S3_IMAGE}
+    env_file:
+      - env/s3.env
+    command: server /data --console-address :9001
+    volumes:
+      - s3-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - james
+
+  james-s3:
+    <<: *james-service
+    profiles: ["s3"]
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+      tika:
+        condition: service_started
+      s3:
+        condition: service_started
+    configs:
+      - source: james-blobstore-s3
+        target: /root/conf/blob.properties
+        mode: 0444
+
+  james-filesystem:
+    <<: *james-service
+    profiles: ["filesystem"]
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+      tika:
+        condition: service_started
+    configs:
+      - source: james-blobstore-file
+        target: /root/conf/blob.properties
+        mode: 0444
+
+  roundcube:
+    profiles: ["webmail"]
+    image: ${ROUNDCUBE_IMAGE}
+    env_file:
+      - env/roundcube.env
+    ports:
+      - "8080:80"
+    networks:
+      - james
+    volumes:
+      - roundcube-data:/var/roundcube
+
+networks:
+  james:
+    name: ${NETWORK_NAME}
+
+volumes:
+  cassandra-data:
+  opensearch-data:
+  rabbitmq-data:
+  james-var:
+  s3-data:
+  roundcube-data:
+
+configs:
+  james-blobstore-s3:
+    file: ./conf/blobstore.s3.properties
+  james-blobstore-file:
+    file: ./conf/blobstore.file.properties

@@ -1,0 +1,133 @@
+= Midscale Distributed Deployment with Docker Compose
+:page-nav-title: Midscale Deployment
+
+This guide explains how to deploy the distributed Apache James server for a midscale workload (≈20k users, ≈100k inbound and ≈40k outbound messages per day) by using the docker-compose bundle provided in the repository. It also covers multi-tenant configuration, storage backend switching, and scaling considerations.
+
+== Repository Layout
+
+The deployment assets live under `deploy/midscale-distributed/`:
+
+* `docker-compose.yml` wires James together with Cassandra, OpenSearch (Elasticsearch-compatible), RabbitMQ, Apache Tika, and optional storage backends.
+* `.env` pins the container image versions and project name so that upgrades can be tracked explicitly.
+* `env/*.env` group per-service tunables that should be adapted to the target infrastructure before the first start.
+* `conf/blobstore.s3.properties` and `conf/blobstore.file.properties` are ready-to-apply overrides for the James `blob.properties` configuration file.
+
+Copy the directory to the server where the stack will run and review each configuration file before starting the services.
+
+== Preparing the Environment
+
+1. Install a recent Docker Engine and Docker Compose plugin (v2.20+ recommended).
+2. Adjust the `.env` file whenever you want to override the default images or network name. Pinning exact versions avoids pulling incompatible releases inadvertently.
+3. Update every file under `env/` to reflect the sizing and security requirements of your environment. In particular:
+
+[cols="1,3", options="header"]
+|===
+|File|Purpose
+|`env/james.env`|JVM heap sizing and the initial domain that is created on bootstrap.
+|`env/cassandra.env`|Cluster identity and heap settings for the primary metadata store.
+|`env/opensearch.env`|Memory footprint and single-node development flags for the search index. Remove the single-node flag when scaling out.
+|`env/rabbitmq.env`|Default credentials and disk usage threshold for the mail queue broker.
+|`env/s3.env`|Credentials and region metadata for the MinIO gateway that emulates S3.
+|`env/roundcube.env`|Connection settings for the optional Roundcube webmail instance.
+|===
+
+4. (Optional) Create a dedicated Docker network in advance if you need to integrate the stack with other Compose projects. Otherwise the default network declared in `.env` will be created on-demand.
+
+== Storage Backend Switching
+
+Two storage strategies are supported out of the box:
+
+S3-compatible object storage::
+Use this profile when messages and attachments must be kept in an external object store. The compose file enables a MinIO gateway by default so you can evaluate the setup locally.
++
+----
+cd deploy/midscale-distributed
+docker compose --profile s3 up -d
+----
++
+The `conf/blobstore.s3.properties` file configures James to connect to the `s3` service with the credentials shipped in `env/s3.env`. Replace the access keys with production secrets before exposing the service publicly. For hardened deployments set `objectstorage.s3.trustall=false` and provide an explicit truststore.
+
+Local Docker volume::
+Select this mode when attachments must remain on the server filesystem. James will write blobs into the `james-var` Docker volume that is mounted at `/root/var` inside the container.
++
+----
+cd deploy/midscale-distributed
+docker compose --profile filesystem up -d
+----
++
+The `conf/blobstore.file.properties` configuration activates the file-backed blob store while keeping deduplication enabled to save space when tenants share large attachments.
+
+You can switch between both profiles by stopping the active stack (`docker compose down`) and starting it again with the alternate profile. The persisted volumes are isolated, so data written with one backend will not be visible in the other mode.
+
+== Multi-tenant Configuration
+
+James stores tenant-specific information (domains, users, quotas, routing rules) in Cassandra. After the containers are healthy,
+the WebAdmin API exposed on port `8000` becomes available for scripted administration. Authentication defaults to the same user
+database as the mail protocols, so tenant operators can use Basic Auth with their own James credentials. The https://james.a
+pache.org/server/manage-webadmin.html[WebAdmin reference documentation] lists every endpoint and payload. For quick bootstrap:
+
+. Create or import the domains that you want to serve:
++
+----
+docker compose --profile s3 exec james-s3 james-cli AddDomain tenant-a.example
+----
++
+Replace `--profile s3` and the service name with `--profile filesystem exec james-filesystem` when using the local blob store.
+. Provision accounts per tenant:
++
+----
+docker compose --profile s3 exec james-s3 james-cli CreateUser alice@tenant-a.example "strong-password"
+----
+. Define per-tenant quotas as needed:
++
+----
+docker compose --profile s3 exec james-s3 james-cli SetQuota --domain tenant-a.example --count 20000 --size 5GB
+----
+. Configure routing rules (aliases, forwards, bounces) with the CLI (`RecipientRewriteTable`) so each tenant can keep its own namespace without interfering with others.
+. Automate recurring administration tasks by storing the CLI commands in shell scripts and running them through `docker compose exec` during provisioning.
+
+The default `DOMAIN` value in `env/james.env` ensures that a bootstrap domain exists so you can authenticate immediately after the first start. Remove it once you automate domain creation with the CLI.
+
+== Optional Webmail Frontend
+
+Some tenants prefer a bundled webmail experience rather than configuring local IMAP clients. The compose bundle ships with an optional `webmail` profile that deploys Roundcube pre-wired against the James IMAP and SMTP endpoints. Combine it with either storage profile depending on where you persist blobs:
+
+----
+cd deploy/midscale-distributed
+docker compose --profile s3 --profile webmail up -d
+----
+
+Roundcube listens on port `8080` by default. Adjust the credentials and plugin list in `env/roundcube.env` before the first sta
+rt so that the login page is branded appropriately and tenant administrators can manage server-side filters through ManageSieve
+. The SQLite-backed data directory persists inside the `roundcube-data` Docker volume—include it in your backup schedule alongs
+ide Cassandra and the blob store. For production you can replace the embedded database with MariaDB or PostgreSQL by editing th
+e environment file.
+
+== Scaling Plan
+
+The compose bundle is optimized for a single host proof-of-concept. When approaching the 20k-user target you should progressively evolve the architecture:
+
+James application nodes::
+Scale horizontally by running multiple James containers (for example on Kubernetes or multiple Docker hosts) behind a TCP load balancer. Share the same Cassandra, RabbitMQ, and blob storage backends. Allocate 4–6 GiB RAM per node and monitor heap pressure via Glowroot.
+
+Cassandra::
+Move to a 3+ node cluster before onboarding production users. Use network-attached SSDs, enable the `LocalQuorum` consistency level, and spread replicas across availability zones. Run regular `nodetool cleanup` and `nodetool repair` jobs.
+
+OpenSearch::
+Switch off `discovery.type=single-node`, set the minimum master nodes to avoid split-brain, and add at least two data nodes plus a dedicated coordinator for search-heavy tenants. Retune `OPENSEARCH_JAVA_OPTS` according to heap sizing best practices (half of available RAM, up to 31 GiB).
+
+RabbitMQ::
+Convert the single instance to a mirrored queue cluster with quorum queues so that transient spikes (≈140k total daily messages) do not accumulate. Monitor consumer acknowledgements from James to detect back-pressure early.
+
+Object storage::
+For the S3 profile rely on a managed provider or deploy a distributed MinIO cluster. Keep versioning enabled and enforce lifecycle policies so obsolete blobs are reclaimed automatically. For the filesystem profile back the `james-var` volume with redundant storage (RAID1/RAID10) and routine snapshots.
+
+Tika::
+The default single container is usually sufficient. If message extraction becomes a bottleneck, front it with an HTTP load balancer and run multiple replicas registered under the same DNS entry referenced in James configuration.
+
+== Operations Checklist
+
+* Back up Cassandra keyspaces and the blob store on a daily basis.
+* Monitor SMTP/IMAP/JMAP response times, queue depths, and JVM metrics.
+* Automate configuration management by checking the env files and blobstore overrides into your infrastructure repository and reviewing them alongside application code.
+* Document tenant onboarding steps (domain creation, administrators, quotas) so that they can be repeated consistently by the operations team.
